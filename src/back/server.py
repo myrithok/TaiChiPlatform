@@ -9,6 +9,8 @@ import uuid
 from aiohttp import web
 from aiortc import (
     MediaStreamTrack,
+    RTCConfiguration,
+    RTCIceServer,
     RTCPeerConnection,
     RTCSessionDescription,
     VideoStreamTrack,
@@ -28,7 +30,8 @@ RESPONSE_HEADER = {
 ROOT = os.path.dirname(__file__)
 
 logger = logging.getLogger("pc")
-peer_connections = set()
+guest_connections = {}
+instructor_connections = {}
 relay = MediaRelay()
 source_video = VideoStreamTrack()
 NO_TRANSFORM: str = "none"
@@ -71,6 +74,8 @@ async def consume(request):
         )
 
     body = await request.json()
+    client = request.remote
+    print(client)
     try:
         validate(instance=body, schema=consumer_schema)
     except ValidationError as error:
@@ -79,7 +84,17 @@ async def consume(request):
     description = RTCSessionDescription(sdp=body["sdp"], type=body["type"])
     pc = RTCPeerConnection()
     pc_id = "PeerConnection(%s)" % uuid.uuid4()
-    peer_connections.add(pc)
+    if client in guest_connections:
+        await guest_connections[client].close()
+        guest_connections.pop(client)
+    guest_connections[client] = pc
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        log_info("Connection state is %s", pc.connectionState)
+        if pc.connectionState == "failed":
+            await pc.close()
+            guest_connections.pop(pc)
 
     def log_info(msg, *args):
         logger.info(pc_id + " " + msg, *args)
@@ -92,10 +107,11 @@ async def consume(request):
 
     pc.addTrack(relay.subscribe(transformed_track))
     log_info("Track %s sent", source_video.kind)
-
     await pc.setRemoteDescription(description)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
+
+    log_info("Test: %s",pc.remoteDescription)
 
     return web.Response(
         content_type="application/json",
@@ -115,6 +131,7 @@ async def broadcast(request):
         )
 
     body = await request.json()
+    client = request.remote
     try:
         validate(instance=body, schema=broadcast_schema)
     except ValidationError as error:
@@ -124,7 +141,10 @@ async def broadcast(request):
 
     pc = RTCPeerConnection()
     pc_id = "PeerConnection(%s)" % uuid.uuid4()
-    peer_connections.add(pc)
+    if client in instructor_connections:
+        instructor_connections[client].close()
+        instructor_connections.pop(client)
+    instructor_connections[client] = pc
 
     def log_info(msg, *args):
         logger.info(pc_id + " " + msg, *args)
@@ -143,7 +163,7 @@ async def broadcast(request):
         log_info("Connection state is %s", pc.connectionState)
         if pc.connectionState == "failed":
             await pc.close()
-            peer_connections.discard(pc)
+            instructor_connections.pop(pc)
 
     @pc.on("track")
     def on_track(track):
@@ -177,9 +197,10 @@ async def broadcast(request):
 
 async def on_shutdown(app):
     # close peer connections
-    coros = [pc.close() for pc in peer_connections]
+    coros = [guest_connections[guest].close for guest in guest_connections.keys()] + [instructor_connections[instructor].close for instructor in instructor_connections.keys()]
     await asyncio.gather(*coros)
-    peer_connections.clear()
+    guest_connections.clear()
+    instructor_connections.clear()
 
 
 if __name__ == "__main__":
